@@ -1,66 +1,59 @@
 import './style.css'
 import * as THREE from 'three'
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import * as CANNON from 'cannon-es'
-import { Object3D } from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { ArrowHelper, Object3D } from 'three';
+import { threeToCannonVec, cannonToThreeVec, parametersToVec, moveCameraToFitBounds, fitCameraToCenteredObject, concreteMaterial, plasticMaterial, GEOMETRY_TYPE, getGeometryType, simplifyPosition, simplifyQuaternion } from "./utils";
+import { degToRad } from 'three/src/math/MathUtils';
+import CannonDebugger from 'cannon-es-debugger'
+import * as CannonWorkerType from "./worker"; 
+// @ts-ignore
+import CannonWorker from "workerize-loader!./worker";
 
 const color_black = 0x000000;
 const color_white = 0xFFFFFF;
 
-const threeToCannonVec = (vec: THREE.Vector3): CANNON.Vec3 => {
-    return new CANNON.Vec3(vec.x, vec.y, vec.z); 
-}
-
-const cannonToThreeVec = (vec: CANNON.Vec3): THREE.Vector3 => {
-	return new THREE.Vector3(vec.x, vec.y, vec.z); 
-}
-
-const parametersToVec = (params: {width: number, height: number, depth: number}) => {
-    return new THREE.Vector3(params.width, params.height, params.depth); 
-}
-
-const moveCameraToFitBounds = (camera: THREE.PerspectiveCamera, width: number, height: number, fov: number): void => {
-	const side = Math.max(width, height);
-	// Move the camera z to fit the box
-	camera.position.z = side / Math.tan(Math.PI * fov / 360);
-}
+// Initialize Physics Worker
+const cannon_worker = CannonWorker() as typeof CannonWorkerType; 	
 
 /**
  * 
  */
 class PhysicsMesh extends THREE.Mesh {
-	physics_body: CANNON.Body;
+	readonly guid: string;
 
-	constructor(physicsOpts?: CANNON.BodyOptions) {
-		super()
+	constructor(physicsOpts?: CANNON.BodyOptions, geometry?: THREE.BufferGeometry, material?: THREE.Material | THREE.Material[]) {
+		super(geometry, material)
 
-		const physics_opts = {
-			mass: 1, 
-			...physicsOpts
-		}
+		this.guid = Math.floor(Math.random() * 100000) + '';
+		const geometry_type: GEOMETRY_TYPE = getGeometryType(geometry); 
 
-		const geometry = this.geometry;
-		let physics_shape; 
-
-		if(geometry instanceof THREE.BoxGeometry) {
-			const { width, height, depth } = geometry.parameters;
-			const half_extents = new CANNON.Vec3(width / 2, height / 2, depth / 2);
-			physics_shape = new CANNON.Box(half_extents)
-		}
-		else {
-			console.error("Create physics config for geometry:", geometry);
-		}
-		this.physics_body = new CANNON.Body({
-			shape: physics_shape,
-			mass: 1, 
-			...physics_opts
-		})
+		cannon_worker.addBody(
+			this.guid, 
+			geometry_type,
+			(geometry as THREE.BoxGeometry | THREE.PlaneGeometry).parameters,
+			{x: this.position.x, y: this.position.y, z: this.position.z},
+			{x: this.quaternion.x, y: this.quaternion.y, z: this.quaternion.z, w: this.quaternion.w},
+			physicsOpts
+		)
+		.catch(e => console.error(e))
 	}
 
-	updatePhysics() {
-		this.position.copy(cannonToThreeVec(this.physics_body.position));
-		const { x, y, z, w } = this.physics_body.quaternion;
-		this.quaternion.copy(new THREE.Quaternion(x, y, z, w));
+	updateBodyPositionQuaternion() {
+		try {
+			cannon_worker.updateBodyPositionQuaternion(
+				this.guid, 
+				simplifyPosition(this.position), 
+				simplifyQuaternion(this.quaternion)
+			);
+		} catch (error) {
+			console.log("Error updating position and quaternion", this);
+		}
+	}
+
+	setMeshPosQuatFromBody(physics_body: CANNON.Body) {
+		this.position.copy(physics_body.position as unknown as THREE.Vector3)
+		this.quaternion.copy(physics_body.quaternion as unknown as THREE.Quaternion)
 	}
 }
 
@@ -68,60 +61,59 @@ class PhysicsMesh extends THREE.Mesh {
  * 
  */
 class SceneWrapper {
-	canvas: HTMLCanvasElement
-	scene: THREE.Scene 
-	renderer: THREE.WebGLRenderer
-	camera: THREE.PerspectiveCamera 
-	controls: OrbitControls 
-	world: CANNON.World
-	fov: number
+	readonly fov: number = 75;
+	readonly canvas: HTMLCanvasElement
+	readonly scene: THREE.Scene 
+	readonly renderer: THREE.WebGLRenderer
+	readonly camera: THREE.PerspectiveCamera 
+	readonly controls: OrbitControls 
+	readonly clock: THREE.Clock
+	cannon_debugger: any
+	debug_cube_mesh: THREE.Mesh
 	image_texture: THREE.Texture 
 	image_cubes: Array<{three_object: THREE.Mesh, physics_body: CANNON.Body}>
-	vars: {
-		window_width: number,
-		window_height: number,
-		window_ratio: number,
-		scene_width: number,
-		scene_height: number,
-		container_width: number,
-		container_height: number,
-		image_width: number,
-		image_height: number,
-		image_scale: number,
-		scene_border: number,
-		container_border: number,
-		scene_depth: number,
-		grid_size: number,
-		has_physics: boolean
-	}
-	clock: THREE.Clock
+	force_arrow_helper: ArrowHelper
 	elapsedTime: number
+	window_width: number = 0;
+	window_height: number = 0;
+	window_ratio: number = 0;
+	scene_width: number = 50;
+	scene_height: number = 0;
+	container_group: THREE.Group;
+	container_width: number = 0;
+	container_height: number = 0;
+	container_depth: number = 0; 
+	image_width: number = 0;
+	image_height: number = 0;
+	image_ratio: number = 0;
+	image_scale: number = 0;
+	has_physics: boolean = false;
+	readonly scene_border_percent: number = 0.1;
+	readonly container_thickness: number = 0.1;
+	readonly container_border_percent: number = 0.1;
+	readonly scene_depth_percent: number = 0.2;
+	readonly grid_size: number = 20;
+	readonly grid_gap_percent: number = 0.003;
 
 	constructor() {
-		this.init = this.init.bind(this);
-		this.init();
-	}
-
-	async init() {
 		// Bindings
-		this.onResize 			= this.onResize.bind(this); 
-		this.updatePhysics 	= this.updatePhysics.bind(this); 
-		this.tick 					= this.tick.bind(this);
-		this.addDebugCube 	= this.addDebugCube.bind(this);
-		this.addContainer 	= this.addContainer.bind(this);
-		this.addImageCubes 	= this.addImageCubes.bind(this);
-		this.addLights 			= this.addLights.bind(this);
+		this.onResize 						= this.onResize.bind(this); 
+		this.updatePhysics 				= this.updatePhysics.bind(this); 
+		this.tick 								= this.tick.bind(this);
+		this.addDebugCube 				= this.addDebugCube.bind(this);
+		this.addContainer 				= this.addContainer.bind(this);
+		this.addImageCubes 				= this.addImageCubes.bind(this);
+		this.addLights 						= this.addLights.bind(this);
+		this.initSceneElements		= this.initSceneElements.bind(this);
+		this.addForceArrow				= this.addForceArrow.bind(this);
+		this.addAxesHelper				= this.addAxesHelper.bind(this);
+		this.start								= this.start.bind(this);
 
 		// Init Canvas
 		this.canvas = document.querySelector('canvas.webgl')
 
 		// Init Scene
 		this.scene = new THREE.Scene()
-
-		// Init Physics
-		this.world = new CANNON.World({
-			gravity: new CANNON.Vec3(0, 0, 0),
-		})
 
 		// Init Renderer
 		this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas })
@@ -139,188 +131,220 @@ class SceneWrapper {
     this.controls = new OrbitControls(this.camera, this.canvas)
     this.controls.enableDamping = true
 		
-		// Vars
-		// TODO: Move some vars to consts
-		this.fov = 75; 
-		this.vars = {
-			window_width: 0,
-			window_height: 0,
-			window_ratio: 0,
-			scene_width: 50,
-			scene_height: 0,
-			container_width: 0,
-			container_height: 0,
-			image_width: 0,
-			image_height: 0, 
-			image_scale: 1,
-			scene_border: 1,
-			container_border: 10,
-			scene_depth: 10,
-			grid_size: 2,
-			has_physics: false
-		};
-		this.vars.container_width = this.vars.scene_width - this.vars.scene_border;
-		this.vars.image_width 		= this.vars.container_width - this.vars.container_border;
+		// Init Timing / Updates
+		this.clock = new THREE.Clock()
+
+		// Start scene
+		this.start();
+	}
+
+	async start() {
+		await this.loadImage();
+
+		// Add cannon debugger (kills perf because debugger needs a world in main thread)
+		// const world = await cannon_worker.getWorld(); 
+		// this.cannon_debugger = CannonDebugger(this.scene, world)
 
 		// Resize
 		window.addEventListener('resize', this.onResize); 
 		this.onResize();
 
-		// Load Image
-		const loader = new THREE.TextureLoader();
-		this.image_texture = await loader.loadAsync('/textures/catapillar.jpg');
-		const image_natural_width = this.image_texture?.image?.naturalWidth || 0;
-		const image_natural_height = this.image_texture?.image?.naturalHeight || 0;
-
-		// Scale longest side of image to fixed size 
-		if(image_natural_width > image_natural_height) {
-			this.vars.image_scale = this.vars.image_width / image_natural_width;
-		} else {
-			this.vars.image_scale = this.vars.image_width / image_natural_height;
-		}
-
-		// Vars
-		// const grid_size = 2; // MUST BE POWER OF TWO 
-    // const grid_gap = 50; 
-		// const total_gap = (grid_size - 1) * grid_gap; 
-    // const col_size = image_width / grid_size; 
-    // const row_size = image_height / grid_size; 
-    // this.image_texture.repeat.set(1 / grid_size, 1 / grid_size);
-
-		// Add Elements
-		// this.addDebugCube();
-		this.addContainer(); 
-		this.addImageCubes();
-		this.addLights();
-
-		// Move camera to fit image
-		moveCameraToFitBounds(this.camera, this.vars.scene_width, this.vars.scene_height, this.fov); 
-
-		// Add axes helper
-		const axes_helper = new THREE.AxesHelper();
-		this.scene.add(axes_helper);
-
 		// Init Timing / Updates
-		this.clock = new THREE.Clock()
 		this.elapsedTime = this.clock.getElapsedTime(); 
 
 		requestAnimationFrame(this.tick);
 	}
 
+	async loadImage() {
+		// Load Image
+		const loader = new THREE.TextureLoader();
+		this.image_texture = await loader.loadAsync('/textures/face.png');
+		const image_natural_width = this.image_texture?.image?.naturalWidth || 0;
+		const image_natural_height = this.image_texture?.image?.naturalHeight || 0;
+		this.image_ratio = image_natural_width / image_natural_height; 
+	}
+
+	initSceneElements() {
+		let obj: THREE.Object3D; 
+
+		for( var i = this.scene.children.length - 1; i >= 0; i--) { 
+			obj = this.scene.children[i];
+			this.scene.remove(obj); 
+		} 
+
+		// Add Elements
+		this.addAxesHelper();
+		this.addForceArrow();
+		// this.addDebugCube();
+		this.addContainer(); 
+		this.addImageCubes();
+		this.addLights();
+	}
+
 	onResize() {
 		// Update sizes
-		this.vars.window_width 			= window.innerWidth;
-		this.vars.window_height 		= window.innerHeight;
-		this.vars.window_ratio 			= this.vars.window_height / this.vars.window_width;
-		this.vars.scene_height 			= this.vars.scene_width * this.vars.window_ratio;
-		this.vars.container_width 	= this.vars.scene_width - this.vars.scene_border;
-		this.vars.container_height 	= this.vars.container_width * this.vars.window_ratio;
-		this.vars.image_width       = this.vars.container_width - this.vars.container_border;
-		this.vars.image_height      = this.vars.container_height - this.vars.container_border;
+		this.window_width 			= window.innerWidth;
+		this.window_height 			= window.innerHeight;
+		this.window_ratio 			= this.window_height / this.window_width;
+		this.scene_height 			= this.scene_width * this.window_ratio;
+		this.container_width 		= this.scene_width;
+		this.container_height		= this.scene_height;
+		this.container_depth 		= (this.container_width * this.scene_depth_percent) + this.container_thickness;
 		
-		// Update camera
-		this.camera.aspect = this.vars.window_width / this.vars.window_height
-		this.camera.updateProjectionMatrix()
-		moveCameraToFitBounds(this.camera, this.vars.scene_width, this.vars.scene_height, this.fov); 
+		if(this.image_ratio > this.window_ratio) {
+			this.container_width = this.scene_width;
+			this.container_height = this.scene_width / this.image_ratio;
+		}
+		else {
+			this.container_width = this.scene_height * this.image_ratio;
+			this.container_height = this.scene_height;
+		}
+
+		this.image_width = this.container_width - (this.container_width * this.container_border_percent);
+		this.image_height = this.container_height - (this.container_width * this.container_border_percent);
+
 
 		// Update renderer
-		this.renderer.setSize(this.vars.window_width, this.vars.window_height)
+		this.renderer.setSize(this.window_width, this.window_height)
 		this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+
+		// Update camera
+		this.camera.aspect = this.window_width / this.window_height
+
+		// Controls
+		// this.controls.handleResize();
+
+		// Update elements based on new size
+		this.initSceneElements();
+
+		// 
+		fitCameraToCenteredObject(this.camera, this.container_group, null, this.controls); 
+	}
+
+	addAxesHelper() {
+		const axes_helper = new THREE.AxesHelper();
+		this.scene.add(axes_helper);
+	}
+
+	addForceArrow() {
+		const dir = new THREE.Vector3(0, 0, 0); 
+		dir.normalize();
+		const origin = new THREE.Vector3(0, 0, 0); 
+		this.force_arrow_helper = new THREE.ArrowHelper( dir, origin, 0, 0xff0000 );
+		this.scene.add(this.force_arrow_helper)
 	}
 
 	addDebugCube() {
-    const cube_geo = new THREE.BoxGeometry(28, 28, 1); 
+    const cube_geo = new THREE.BoxGeometry(0.5, 0.5, 0.5);
     const cube_mat = new THREE.MeshNormalMaterial();
-    const cube_mesh = new THREE.Mesh(cube_geo, cube_mat);
-    this.scene.add(cube_mesh);
-	}
+    this.debug_cube_mesh = new THREE.Mesh(cube_geo, cube_mat);
+		this.debug_cube_mesh.position.set(0, 0, 0);
+    this.scene.add(this.debug_cube_mesh);
 
-	updatePhysics() {
-		this.world.fixedStep();
-		this.scene.traverse(object => {
-			if(object instanceof PhysicsMesh) {
-				object.updatePhysics()
-			}
-		})
+		console.log('debug');
+		// this.camera.position.set(0, 0, -1);
+		// this.camera.lookAt(cube_mesh.position);
+
+		// const cube_two_geo = new THREE.BoxGeometry(28, 15, 8);
+    // const cube_two_mat = new THREE.MeshBasicMaterial({color: 'red'});
+    // const cube_two_mesh = new PhysicsMesh({mass: 0}, cube_two_geo, cube_two_mat);
+		// cube_two_mesh.position.set(10, 10, 10); 
+		// cube_two_mesh.updateBodyPositionQuaternion();
+    // this.scene.add(cube_two_mesh);
 	}
 
 	addContainer() {
-		// Build container cube 
-    const container_geometry = new THREE.BoxGeometry(this.vars.container_width, this.vars.container_height, this.vars.scene_depth); 
-    const container_material = new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, });
-    const container_mesh = new THREE.Mesh(container_geometry, [
-			container_material, 
-			container_material, 
-			container_material, 
-			container_material, 
-			null, 
-			container_material
-		]);
-		container_mesh.castShadow = true;
-		container_mesh.receiveShadow = true;
-    this.scene.add(container_mesh)
+		this.container_group = new THREE.Group();
+		const container_thickness = this.container_thickness;
+		console.log(container_thickness);
+		
+		const container_mat = new THREE.MeshStandardMaterial();
+		const container_physics_opts = {
+			type: CANNON.BODY_TYPES.STATIC,
+			material: concreteMaterial,
+			mass: 0,
+		}
 
-		// Physics
-    // const container_physics_shape = new CANNON.Box(threeToCannonVec(parametersToVec(container_geometry.parameters)));
-    // const container_physics_body = new CANNON.Body({ 
-    //     mass: 1, 
-    //     shape: container_physics_shape, 
-    //     type: CANNON.BODY_TYPES.STATIC, 
-    //     position: threeToCannonVec(container_mesh.position)  
-    // })
-    // container_mesh.receiveShadow = true; 
-    // this.world.addBody(container_physics_body); 
+		const total_width = this.container_width + container_thickness;
+		const total_height = this.container_height + container_thickness;
+
+		// Back
+		const box_back_geometry = new THREE.BoxGeometry(total_width, total_height, container_thickness);
+		const box_back_material = container_mat.clone(); 
+		const box_back_mesh			= new PhysicsMesh(container_physics_opts, box_back_geometry, box_back_material);
+		box_back_mesh.position.set(0, 0, -this.container_depth / 2); 
+		box_back_mesh.updateBodyPositionQuaternion(); 
+
+		// Left
+		const box_left_geometry = new THREE.BoxGeometry(container_thickness, total_height, this.container_depth);
+		const box_left_material = container_mat.clone(); 
+		const box_left_mesh			= new PhysicsMesh(container_physics_opts, box_left_geometry, box_left_material);
+		box_left_mesh.position.set(-total_width / 2, 0, 0); 
+		box_left_mesh.updateBodyPositionQuaternion();
+		
+		// Right
+		const box_right_geometry = new THREE.BoxGeometry(container_thickness, total_height, this.container_depth);
+		const box_right_material = container_mat.clone(); 
+		const box_right_mesh			= new PhysicsMesh(container_physics_opts, box_right_geometry, box_right_material);
+		box_right_mesh.position.set(total_width / 2, 0, 0); 
+		box_right_mesh.updateBodyPositionQuaternion();
+
+		// Top
+		const box_top_geometry = new THREE.BoxGeometry(total_width, container_thickness, this.container_depth);
+		const box_top_material = container_mat.clone(); 
+		const box_top_mesh			= new PhysicsMesh(container_physics_opts, box_top_geometry, box_top_material);
+		box_top_mesh.position.set(0, total_height / 2, 0); 
+		box_top_mesh.updateBodyPositionQuaternion();
+
+		// Bottom
+		const box_bottom_geometry = new THREE.BoxGeometry(total_width, container_thickness, this.container_depth);
+		const box_bottom_material = container_mat.clone(); 
+		const box_bottom_mesh			= new PhysicsMesh(container_physics_opts, box_bottom_geometry, box_bottom_material);
+		box_bottom_mesh.position.set(0, -total_height / 2, 0); 
+		box_bottom_mesh.updateBodyPositionQuaternion();
+
+    this.container_group.add(box_back_mesh)
+    this.container_group.add(box_left_mesh)
+    this.container_group.add(box_right_mesh)
+    this.container_group.add(box_top_mesh)
+    this.container_group.add(box_bottom_mesh)
+		this.scene.add(this.container_group);
+		const box = new THREE.BoxHelper( this.container_group, 0xffff00 );
+		this.scene.add( box );
 	}
 
 	addImageCubes() {
-    // Store physics bodies
-    this.image_cubes = []
+		const gap_size = this.image_width * this.grid_gap_percent;
+		const total_gap_size = Math.max((this.grid_size - 1), 0) * gap_size;
+		const col_size = (this.image_width - total_gap_size) / this.grid_size; 
+		const row_size = (this.image_height - total_gap_size) / this.grid_size; 
+		const image_depth = this.container_depth * 0.5;
+		const x_left = -this.image_width / 2;
+		const y_top = -this.image_height / 2;
 
-		const image_geometry	= new THREE.BoxGeometry(this.vars.image_width, this.vars.image_height, this.vars.scene_depth);
-		const image_material	= new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
-		image_material.map = this.image_texture.clone();
-		// const image_mesh = new THREE.Mesh(image_geometry, [null, null, null, null, image_material, null, null]); 
-		const image_mesh = new THREE.Mesh(image_geometry, image_material); 
-		image_mesh.castShadow = true;
-		image_mesh.receiveShadow = true;
-		image_mesh.position.z = 1;
-		this.image_cubes.push({three_object: image_mesh, physics_body: new CANNON.Body()})
-		this.scene.add(image_mesh);
+    for(let c = 0; c < this.grid_size; c++) {
+			for(let r = 0; r < this.grid_size; r++) {
+				const x = x_left + (col_size * (c + 1)) + (gap_size * Math.max(c, 0)) - (col_size / 2);
+				const y = y_top + (row_size * (r + 1)) + (gap_size * Math.max(r, 0)) - (row_size / 2);
 
-    // for(let c = 0; c < this.vars.grid_size; c++) {
-		// 	for(let r = 0; r < this.vars.grid_size; r++) {
-		// 		const x = col_size * c - image_width / 2 + col_size / 2 - total_gap / 2 + (grid_gap * c - 1);
-		// 		const y = row_size * r - image_height / 2 + row_size / 2 - total_gap / 2 + (grid_gap * r - 1);
-
-		// 		const cube_physics_extents  = new CANNON.Vec3(cube_geo.depth, cube_geo.height)
-		// 		const cube_geo = new THREE.BoxGeometry(col_size, row_size, scene_depth, 1, 1, 1);
-		// 		const cube_mat = new THREE.MeshBasicMaterial({ color: 'green' })
+				const cube_geo = new THREE.BoxGeometry(col_size, row_size, image_depth, 1, 1, 1);
+				const cube_mat = new THREE.MeshBasicMaterial()
+				const cube_mesh = new PhysicsMesh({
+					mass: 1,
+					material: plasticMaterial
+				}, cube_geo, cube_mat); 
+				cube_mesh.castShadow = true;
+				cube_mesh.receiveShadow = true;
+				cube_mesh.position.set(x, y, 0);
+				cube_mesh.updateBodyPositionQuaternion();
 				
-		// 		const cube_physics_shape    = new CANNON.Box(cube_physics_extents);
-		// 		const cube_physics_body = new CANNON.Body({
-		// 		    mass: 1, 
-		// 		    position: new CANNON.Vec3(x, y, this.vars.scene_depth),
-		// 		    shape: cube_physics_shape,
-		// 		    // material: defaultMaterial
-		// 		})
-
-				
-		// 		cube_mat.map = this.image_texture.clone();
-		// 		cube_mat.map.offset.set(c / grid_size, r / grid_size);
-				
-		// 		// const cube_mesh = new THREE.Mesh(cube_geo, [null, null, null, null, cube_mat, null, null]); 
-		// 		const cube_mesh = new THREE.Mesh(cube_geo, cube_mat);
-		// 		cube_mesh.position.copy(cube_physics_body.position); 
-
-		// 		world.addBody(cube_physics_body);
-		// 		scene.add(cube_mesh);
-
-		// 		cubes.push({
-		// 		    three: cube_mesh,
-		// 		    physics: cube_physics_body
-		// 		})
-		// 	}
-    // }
+				cube_mat.map = this.image_texture.clone();
+				cube_mat.map.repeat.set(1 / this.grid_size, 1 / this.grid_size)
+				cube_mat.map.offset.set(c / this.grid_size, r / this.grid_size);
+		
+				this.scene.add(cube_mesh);
+			}
+    }
 	}
 
 	addLights() {
@@ -332,203 +356,87 @@ class SceneWrapper {
     const dLight1 = new THREE.DirectionalLight(color_white, 0.8);
     dLight1.castShadow = true;
     dLight1.position.set(5, 5, 10);
-		dLight1.target = this.image_cubes[0].three_object;
+		// dLight1.target = this.image_cubes[0].three_object;
 		this.scene.add(dLight1);
 
 		// Add light
 		const dLight2 = new THREE.DirectionalLight(color_white, 0.3);
 		dLight2.castShadow = true;
 		dLight2.position.set(-30, -30, 20);
-		dLight2.target = this.image_cubes[0].three_object;
+		// dLight2.target = this.image_cubes[0].three_object;
 		this.scene.add(dLight2);
+	}
+
+	// onWorkerMessage(e: MessageEvent) {
+	// 	const type: WORKER_MESSAGE = e.data.type; 
+	// 	const data: any = e.data.data; 
+
+	// 	switch(type) {
+	// 		case WORKER_MESSAGE.INIT_PHYSICS:
+
+	// 		case WORKER_MESSAGE.TICK: 
+	// 			this.scene.traverse(object => {
+	// 				if(object instanceof PhysicsMesh) {
+	// 					const guid = object.guid;
+
+	// 					// object.physics_body.applyForce(threeToCannonVec(lookAtVector), object.physics_body.position);
+	// 					// object.setMeshPosQuatFromBody()
+	// 				}
+	// 			})
+	// 	}
+	
+		// // Get fresh data from the worker
+		// positions = e.data.positions;
+		// quaternions = e.data.quaternions;
+
+		// // Update rendering meshes
+		// for(var i=0; i!==meshes.length; i++){
+		// 		meshes[i].position.set( positions[3*i+0],
+		// 														positions[3*i+1],
+		// 														positions[3*i+2] );
+		// 		meshes[i].quaternion.set(quaternions[4*i+0],
+		// 															quaternions[4*i+1],
+		// 															quaternions[4*i+2],
+		// 															quaternions[4*i+3]);
+		// }
+
+		// // If the worker was faster than the time step (dt seconds), we want to delay the next timestep
+		// var delay = dt * 1000 - (Date.now()-sendTime);
+		// if(delay < 0){
+		// 		delay = 0;
+		// }
+		// setTimeout(sendDataToWorker,delay);
+	// }
+
+	updatePhysics() {
+		// var lookAtVector = new THREE.Vector3(0,0, -1);
+		// lookAtVector.applyQuaternion(this.camera.quaternion);
+		// lookAtVector.z = 0;
+		// lookAtVector.normalize();
+
+		// const force = 10; 
+		// this.force_arrow_helper.setLength(10); 
+		// this.force_arrow_helper.setDirection(lookAtVector);
+		// lookAtVector.multiplyScalar(force)
+
+
+
+		// this.cannon_debugger.update();
 	}
 
 	tick() {
 		// Call tick again on the next frame
 		window.requestAnimationFrame(this.tick)
-		// const prevTime = this.elapsedTime; 
-		// this.elapsedTime = this.clock.getElapsedTime()
-
-		// Update world
-		if(this.vars.has_physics) {
-			this.updatePhysics()
-		}
 
 		// Update controls
 		this.controls.update()
 
+		// Update world
+		this.updatePhysics()
+		
 		// Render
 		this.renderer.render(this.scene, this.camera)
 	}
 }
 
 export default new SceneWrapper();
-
-
-// async function main() {
-//     /**
-//      * Base
-//      */
-//     // Canvas
-//     const canvas: HTMLElement = document.querySelector('canvas.webgl')
-    
-//     // Scene
-//     const scene = new THREE.Scene()
-    
-
-//     // Physics
-//     const world = new CANNON.World({
-//         gravity: new CANNON.Vec3(0, 0, 0),
-//     })
-//     // const defaultMaterial = new CANNON.Material('default')
-
-//     /**
-//      * Camera
-//      */
-//     // Base camera
-//     const fov = 75; 
-//     const camera = new THREE.PerspectiveCamera(fov, sizes.width / sizes.height, 0.1, 10000)
-//     camera.position.x = 0
-//     camera.position.y = 0
-//     scene.add(camera)
-    
-//     const loader = new THREE.TextureLoader();
-//     const this.image_texture = await loader.loadAsync('/textures/catapillar.jpg');
-
-//     const image_width = this.image_texture.image.naturalWidth;
-//     const image_height = this.image_texture.image.naturalHeight; 
-//     const grid_size = 2; // MUST BE POWER OF TWO 
-//     const grid_gap = 50; 
-//     const scene_depth = 1000; 
-//     const border = 1000; 
-//     const total_gap = (grid_size - 1) * grid_gap; 
-//     const col_size = image_width / grid_size; 
-//     const row_size = image_height / grid_size; 
-//     this.image_texture.repeat.set(1 / grid_size, 1 / grid_size);
-
-//     // Build container cube 
-//     const container_geometry = new THREE.BoxGeometry(image_width + border * 2, image_height + border * 2, scene_depth); 
-//     const container_material = new THREE.MeshStandardMaterial({ color: 0x000000, roughness: 0.8, metalness: 0.5 });
-//     const container_mesh = new THREE.Mesh(container_geometry, container_material);
-//     const container_physics_shape = new CANNON.Box(threeToCannonVec(parametersToVec(container_geometry.parameters)));
-//     const container_physics_body = new CANNON.Body({ 
-//         mass: 1, 
-//         shape: container_physics_shape, 
-//         type: CANNON.BODY_TYPES.STATIC, 
-//         position: threeToCannonVec(container_mesh.position)  
-//     })
-//     container_mesh.receiveShadow = true; 
-//     scene.add(container_mesh)
-//     world.addBody(container_physics_body); 
-
-//     // // Add "Back"
-//     // const back_width = image_width + border * 2;
-//     // const back_height = image_height + border * 2;
-//     // const back_physics_shape = new CANNON.Plane(back_width, back_height);
-//     // console.log(back_physics_shape);
-//     // const back_physics_body  = new CANNON.Body({
-//     //     mass: 1, 
-//     //     type: CANNON.BODY_TYPES.STATIC,
-//     //     position: new CANNON.Vec3(0, 0, scene_depth / 2),
-//     //     shape: back_physics_shape,
-//     //     // material: defaultMaterial
-//     // })
-//     // const back_geo          = new THREE.PlaneGeometry(back_width, back_height);
-//     // const back_mat          = new THREE.MeshBasicMaterial({ color: 'blue' })
-//     // const back_mesh         = new THREE.Mesh(back_geo, back_mat); 
-//     // back_mesh.position.copy(back_physics_body.position);
-//     // back_mesh.quaternion.copy(back_physics_body.quaternion);
-
-//     // scene.add(back_mesh)
-//     // world.addBody(back_physics_body); 
-
-//     // // Build walls
-//     // const addWall = (plane_width, plane_height, plane_x, plane_y, plane_z, rotate_y = 0) => {
-//     //     const wall_physics_shape = new CANNON.Plane(plane_width, plane_height);
-//     //     const wall_physics_body  = new CANNON.Body({
-//     //         mass: 1, 
-//     //         type: CANNON.BODY_TYPES.STATIC,
-//     //         position: new CANNON.Vec3(plane_x, plane_y, plane_z),
-//     //         shape: wall_physics_shape,
-//     //         // material: defaultMaterial
-//     //     })
-//     //     wall_physics_body.quaternion.setFromEuler(Math.PI / 2, rotate_y, 0)
-
-//     //     const wall_geo          = new THREE.PlaneGeometry(plane_width, plane_height);
-//     //     const wall_mat          = new THREE.MeshBasicMaterial({ color: 'red', side: THREE.DoubleSide })
-//     //     const wall_mesh         = new THREE.Mesh(wall_geo, wall_mat); 
-//     //     wall_mesh.position.copy(wall_physics_body.position);
-//     //     wall_mesh.quaternion.copy(wall_physics_body.quaternion);
-         
-//     //     scene.add(wall_mesh)
-//     //     world.addBody(wall_physics_body); 
-//     // }
-    
-//     // // Top
-//     // addWall(image_width + border * 2, scene_depth, 0, -image_height / 2 - border, scene_depth / 2); 
-//     // // Left
-//     // addWall(image_height + border * 2, scene_depth, -image_width / 2 - border, 0, scene_depth / 2, Math.PI / 2);
-//     // // Right
-//     // addWall(image_height + border * 2, scene_depth, image_width / 2 + border, 0, scene_depth / 2, Math.PI / 2);
-//     // // Bottom
-//     // addWall(image_width + border * 2, scene_depth, 0, image_height / 2 + border, scene_depth / 2);
-    
-//     // Fit image to camera
-//     camera.position.z = (image_height + total_gap + (border * 2)) / 2 / Math.tan(Math.PI * fov / 360) * 1.2;
-    
-//     // Store physics bodies
-//     let cubes = []
-
-//     for(let c = 0; c < grid_size; c++) {
-//         for(let r = 0; r < grid_size; r++) {
-//             // const x = col_size * c - image_width / 2 + col_size / 2 - total_gap / 2 + (grid_gap * c - 1);
-//             // const y = row_size * r - image_height / 2 + row_size / 2 - total_gap / 2 + (grid_gap * r - 1);
-
-//             // const cube_physics_extents  = new CANNON.Vec3(container_geometry = new THREE.BoxGeometry(image_width, image_height + border * 2).width, cube_geo.depth, cube_geo.height)
-//             // const cube_geo = new THREE.BoxGeometry(col_size, row_size, scene_depth, 1, 1, 1);
-//             // const cube_mat = new THREE.MeshBasicMaterial({ color: 'green' })
-            
-//             // const cube_physics_shape    = new CANNON.Box(cube_physics_extents);
-//             // const cube_physics_body = new CANNON.Body({
-//             //     mass: 1, 
-//             //     position: new CANNON.Vec3(x, y, scene_depth),
-//             //     shape: cube_physics_shape,
-//             //     // material: defaultMaterial
-//             // })
-
-            
-//             // cube_mat.map = this.image_texture.clone();
-//             // cube_mat.map.offset.set(c / grid_size, r / grid_size);
-            
-//             // // const cube_mesh = new THREE.Mesh(cube_geo, [null, null, null, null, cube_mat, null, null]); 
-//             // const cube_mesh = new THREE.Mesh(cube_geo, cube_mat);
-//             // cube_mesh.position.copy(cube_physics_body.position); 
-
-//             // world.addBody(cube_physics_body);
-//             // scene.add(cube_mesh);
-
-//             // cubes.push({
-//             //     three: cube_mesh,
-//             //     physics: cube_physics_body
-//             // })
-//         }
-//     }
-
-
-
-    
-//     /**
-//      * Renderer
-//      */
-//     const renderer = new THREE.WebGLRenderer({
-//         canvas: canvas
-//     })
-//     renderer.setSize(sizes.width, sizes.height)
-//     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-//     // renderer.physicallyCorrectLights = true;
-//     // renderer.shadowMap.enabled = true;
-//     // renderer.shadowMap.type = THREE.PCFSoftShadowMap; // default THREE.PCFShadowMap
-
-// }
-
-// export default main();
